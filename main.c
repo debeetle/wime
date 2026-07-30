@@ -378,6 +378,8 @@ static void handle_grab_key(void *data,
     if (key_state == 1) {
       s->shift_count++;
       s->shift_combo = false;
+      if (s->active_mods & ~0x01)
+        s->shift_combo = true;
     } else if (s->shift_count > 0) {
       s->shift_count--;
       if (s->shift_count == 0 && !s->shift_combo) {
