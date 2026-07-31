@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-从 dictionary.txt + word_freq.txt 构建 dict.bin 和 dat_dict.h。
+从 dictionary.txt + word_freq.txt 构建 xiaohe.dict 
 
 用法: python3 gen_dat.py
 """
