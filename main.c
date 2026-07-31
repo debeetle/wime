@@ -118,6 +118,20 @@ static int get_recent_count(const char *word) {
   return 0;
 }
 
+static void clear_preedit(struct ime_state *s) {
+  zwp_input_method_v2_set_preedit_string(s->input_method, "", 0, 0);
+  zwp_input_method_v2_commit(s->input_method, s->current_serial);
+  wl_display_flush(s->display);
+}
+
+static void reset_state(struct ime_state *s) {
+  s->buf_len = 0;
+  s->buffer[0] = '\0';
+  s->full_match_count = 0;
+  s->total = 0;
+  s->page = 0;
+}
+
 static char evdev_to_char(uint32_t key) {
   if (key >= KEY_Q && key <= KEY_P)
     return "qwertyuiop"[key - KEY_Q];
@@ -219,22 +233,27 @@ static void compute_candidates(struct ime_state *s) {
   }
 
   if (s->total > 1) {
+    int score[MAX_CANDS];
+    for (int i = 0; i < s->total; i++)
+      score[i] = get_recent_count(s->cand_ptrs[i]);
     for (int i = 1; i < s->total; i++) {
       const char *tmp = s->cand_ptrs[i];
       bool tmp_full = s->cand_is_full[i];
-      int score = get_recent_count(tmp);
-      if (score == 0 && !tmp_full)
+      int sc = score[i];
+      if (sc == 0 && !tmp_full)
         continue;
       int j = i - 1;
       while (j >= 0 && ((!s->cand_is_full[j] && tmp_full) ||
                         (s->cand_is_full[j] == tmp_full &&
-                         get_recent_count(s->cand_ptrs[j]) < score))) {
+                         score[j] < sc))) {
         s->cand_ptrs[j + 1] = s->cand_ptrs[j];
         s->cand_is_full[j + 1] = s->cand_is_full[j];
+        score[j + 1] = score[j];
         j--;
       }
       s->cand_ptrs[j + 1] = tmp;
       s->cand_is_full[j + 1] = tmp_full;
+      score[j + 1] = sc;
     }
     int new_full = 0;
     for (int i = 0; i < s->total && s->cand_is_full[i]; i++)
@@ -253,9 +272,7 @@ static void update_preedit(struct ime_state *s) {
   if (!s->input_method)
     return;
   if (s->buf_len == 0) {
-    zwp_input_method_v2_set_preedit_string(s->input_method, "", 0, 0);
-    zwp_input_method_v2_commit(s->input_method, s->current_serial);
-    wl_display_flush(s->display);
+    clear_preedit(s);
     return;
   }
   compute_candidates(s);
@@ -292,13 +309,8 @@ static void commit_candidate(struct ime_state *s, int page_idx) {
   zwp_input_method_v2_commit_string(s->input_method, t);
   bool is_full = (real_idx < s->total) ? s->cand_is_full[real_idx] : false;
   if (is_full || s->buf_len <= 2) {
-    zwp_input_method_v2_set_preedit_string(s->input_method, "", 0, 0);
-    zwp_input_method_v2_commit(s->input_method, s->current_serial);
-    s->buf_len = 0;
-    s->buffer[0] = '\0';
-    s->full_match_count = 0;
-    s->total = 0;
-    s->page = 0;
+    clear_preedit(s);
+    reset_state(s);
   } else {
     memmove(s->buffer, s->buffer + 2, s->buf_len - 2 + 1);
     s->buf_len -= 2;
@@ -308,10 +320,7 @@ static void commit_candidate(struct ime_state *s, int page_idx) {
 }
 
 static void clear_composing(struct ime_state *s) {
-  s->buf_len = 0;
-  s->buffer[0] = '\0';
-  s->total = 0;
-  s->page = 0;
+  reset_state(s);
   update_preedit(s);
 }
 
@@ -385,13 +394,8 @@ static void handle_grab_key(void *data,
       if (s->shift_count == 0 && !s->shift_combo) {
         if (composing) {
           zwp_input_method_v2_commit_string(s->input_method, s->buffer);
-          zwp_input_method_v2_set_preedit_string(s->input_method, "", 0, 0);
-          zwp_input_method_v2_commit(s->input_method, s->current_serial);
-          s->buf_len = 0;
-          s->buffer[0] = '\0';
-          s->full_match_count = 0;
-          s->total = 0;
-          s->page = 0;
+          clear_preedit(s);
+          reset_state(s);
         }
         s->mode_ascii = !s->mode_ascii;
         if (!s->mode_ascii) {
@@ -400,8 +404,7 @@ static void handle_grab_key(void *data,
           s->zh_indicator_active = true;
           s->zh_indicator_time = get_time_ms();
         } else {
-          zwp_input_method_v2_set_preedit_string(s->input_method, "", 0, 0);
-          zwp_input_method_v2_commit(s->input_method, s->current_serial);
+          clear_preedit(s);
         }
       }
     }
@@ -464,8 +467,7 @@ static void handle_grab_key(void *data,
         if (composing && s->total > 0)
           commit_candidate(s, 0);
         zwp_input_method_v2_commit_string(s->input_method, punct_str);
-        zwp_input_method_v2_set_preedit_string(s->input_method, "", 0, 0);
-        zwp_input_method_v2_commit(s->input_method, s->current_serial);
+        clear_preedit(s);
       }
     }
   }
@@ -570,12 +572,8 @@ static void handle_grab_key(void *data,
     consume = true;
     if (pressed) {
       zwp_input_method_v2_commit_string(s->input_method, s->buffer);
-      zwp_input_method_v2_set_preedit_string(s->input_method, "", 0, 0);
-      zwp_input_method_v2_commit(s->input_method, s->current_serial);
-      s->buf_len = 0;
-      s->buffer[0] = '\0';
-      s->total = 0;
-      s->page = 0;
+      clear_preedit(s);
+      reset_state(s);
     }
   }
 
@@ -779,9 +777,7 @@ int main(int argc, char *argv[]) {
       if (elapsed >= 400) {
         s.zh_indicator_active = false;
         if (s.buf_len == 0) {
-          zwp_input_method_v2_set_preedit_string(s.input_method, "", 0, 0);
-          zwp_input_method_v2_commit(s.input_method, s.current_serial);
-          wl_display_flush(s.display);
+          clear_preedit(&s);
         }
       } else {
         poll_timeout = (int)(400 - elapsed);
