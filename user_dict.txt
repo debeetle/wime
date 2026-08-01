@@ -1,6 +1,0 @@
-# custom words dictionary
-# format: code\t item
-# (obviously can gain in the dictionary.txt directly)
-
-d 的
-l 了
