@@ -12,7 +12,7 @@
 ## 构建
 
 ```sh
-make            # 需安装 wayland-scanner、pkg-config、mold(可选,见 Makefile)
+make # 需安装 wayland-scanner、pkg-config、mold(option)
 ```
 
 `make` 会依次:
@@ -25,7 +25,7 @@ make            # 需安装 wayland-scanner、pkg-config、mold(可选,见 Makef
 
 | 文件 | 作用 |
 |------|------|
-| `dict.txt` | 小鹤双拼词库(源码,`编码<TAB>词`) |
+| `dict.txt` | 可读词库(源码,`编码<TAB>词`) |
 | `word_freq.txt` | 静态词频主表(对候选取主要排序作用) |
 | `google_freq.txt` | Google 词频,补 `word_freq.txt` 缺失词;两者量纲不同,填空时按交集词比值中位数(约 195)缩放 |
 | `user_dict.txt` | 用户自定义高优词,构建时置于候选最前、全局最高频 |
