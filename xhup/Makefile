@@ -26,7 +26,7 @@ dict:
 xiaohe: main.c \
             input-method-unstable-v2-protocol.c input-method-unstable-v2-client-protocol.h \
             virtual-keyboard-unstable-v1-protocol.c virtual-keyboard-unstable-v1-client-protocol.h \
-            dict.h
+            dict.h xiaohe.dict
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ main.c input-method-unstable-v2-protocol.c virtual-keyboard-unstable-v1-protocol.c $(WAYLAND_FLAGS)
 
 clean:

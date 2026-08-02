@@ -15,10 +15,27 @@ MAX_CANDIDATES = 30
 
 
 def load_word_frequencies():
-    """加载词频表 (word_freq.txt)"""
+    """加载词频表 (word_freq.txt),缺失词用 google_freq.txt 填空。
+
+    两表量纲不同(交集词 Google/word_freq 比值中位数约 195),
+    填空时按中位数缩放,避免 Google 词压过 word_freq.txt 的主导地位。
+    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     freq_path = os.path.join(script_dir, "word_freq.txt")
+    google_path = os.path.join(script_dir, "google_freq.txt")
     freq_map = {}
+    google_map = {}
+
+    if os.path.exists(google_path):
+        with open(google_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    word = parts[0]
+                    try:
+                        google_map[word] = int(parts[1])
+                    except ValueError:
+                        pass
 
     if os.path.exists(freq_path):
         with open(freq_path, "r", encoding="utf-8") as f:
@@ -37,6 +54,24 @@ def load_word_frequencies():
         )
     else:
         print("no word_freq.txt, use default order", file=sys.stderr)
+
+    if google_map:
+        # 用交集词的中位数比值把 Google 拉到与 word_freq.txt 同量纲
+        ratios = sorted(
+            freq_map[w] / google_map[w]
+            for w in freq_map
+            if w in google_map and google_map[w] > 0 and freq_map[w] > 0
+        )
+        scale = ratios[len(ratios) // 2] if ratios else 195.0
+        filled = 0
+        for word, g in google_map.items():
+            if word not in freq_map and g > 0:
+                freq_map[word] = max(1, int(g * scale))
+                filled += 1
+        print(
+            f"filled {filled} missing words from google_freq.txt (scale {scale:.2f})",
+            file=sys.stderr,
+        )
 
     return freq_map
 

@@ -191709,7 +191709,6 @@ td	台
 td	呔
 td	囼
 td	坮
-td	大
 td	太
 td	夳
 td	奤
@@ -273057,7 +273056,6 @@ ye	叶
 ye	吔
 ye	咽
 ye	啘
-ye	喝
 ye	嘢
 ye	噎
 ye	嚈

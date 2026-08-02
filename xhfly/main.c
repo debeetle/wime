@@ -15,6 +15,8 @@
 #include <wayland-client.h>
 
 #define MAX_CANDS 30
+#define PAGE_SIZE 3
+#define BOX_BASE 5
 
 struct ime_state {
   struct wl_display *display;
@@ -38,6 +40,8 @@ struct ime_state {
   int full_match_count;
   int total;
   int page;
+  int preview_idx;
+  bool box_shown;
 
   // 模式与标点
   bool mode_ascii;
@@ -65,57 +69,120 @@ static uint64_t get_time_ms(void) {
   return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
-#define PAGE_SIZE 3
+// 墙上时钟(epoch 秒),用于跨会话的用户词频半衰期衰减。
+// CLOCK_MONOTONIC 重启归零,不能用于跨重启的时间差。
+static uint64_t get_epoch_sec(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return (uint64_t)ts.tv_sec;
+}
 
-// --- 最近输入词频重排 ---
-#define MAX_RECENT_WORDS 2048
+// --- 用户词频(持久化,学习真实输入习惯) ---
+// 静态词典词频是构建时烘焙的语料频率,不会随使用更新。
+// 这里维护一份持久化的用户词频:每次上屏一个候选即累加,
+// 存到 xiaohe.userfreq,重启后加载,真正反映用户的输入习惯。
+#define MAX_USER_WORDS 8192
+#define USERFREQ_BOOST 1000000LL
+// 半衰期(秒):用户词频跨会话指数衰减。默认 30 天,即词在 30 天后权重减半,
+// 让陈旧的高频词随时间的推移退场,会话内仍即时累加不受影响。
+#define USERFREQ_HALF_LIFE_SEC (30 * 24 * 3600)
 typedef struct {
   char word[64];
   int count;
   uint64_t last_used;
-} RecentWord;
+} UserWord;
 
-static RecentWord G_RECENT_WORDS[MAX_RECENT_WORDS];
-static int G_RECENT_COUNT = 0;
+static UserWord G_USER_WORDS[MAX_USER_WORDS];
+static int G_USER_COUNT = 0;
+static char G_USERFREQ_PATH[512] = {0};
+static bool G_USERFREQ_DIRTY = false;
+static uint64_t G_LAST_SAVE_MS = 0;
 
-static void record_recent_word(const char *word, uint64_t now_ms) {
+static int get_user_count(const char *word) {
+  for (int i = 0; i < G_USER_COUNT; i++) {
+    if (strcmp(G_USER_WORDS[i].word, word) == 0)
+      return G_USER_WORDS[i].count;
+  }
+  return 0;
+}
+
+static void record_user_word(const char *word, uint64_t now_epoch) {
   if (!word || !word[0])
     return;
-  for (int i = 0; i < G_RECENT_COUNT; i++) {
-    if (strcmp(G_RECENT_WORDS[i].word, word) == 0) {
-      G_RECENT_WORDS[i].count++;
-      G_RECENT_WORDS[i].last_used = now_ms;
+  for (int i = 0; i < G_USER_COUNT; i++) {
+    if (strcmp(G_USER_WORDS[i].word, word) == 0) {
+      G_USER_WORDS[i].count++;
+      G_USER_WORDS[i].last_used = now_epoch;
+      G_USERFREQ_DIRTY = true;
       return;
     }
   }
-  if (G_RECENT_COUNT < MAX_RECENT_WORDS) {
-    strncpy(G_RECENT_WORDS[G_RECENT_COUNT].word, word, 63);
-    G_RECENT_WORDS[G_RECENT_COUNT].word[63] = '\0';
-    G_RECENT_WORDS[G_RECENT_COUNT].count = 1;
-    G_RECENT_WORDS[G_RECENT_COUNT].last_used = now_ms;
-    G_RECENT_COUNT++;
+  int idx;
+  if (G_USER_COUNT < MAX_USER_WORDS) {
+    idx = G_USER_COUNT;
+    G_USER_COUNT++;
   } else {
-    int oldest_idx = 0;
-    uint64_t min_time = G_RECENT_WORDS[0].last_used;
-    for (int i = 1; i < G_RECENT_COUNT; i++) {
-      if (G_RECENT_WORDS[i].last_used < min_time) {
-        min_time = G_RECENT_WORDS[i].last_used;
-        oldest_idx = i;
-      }
+    // 满员:淘汰使用次数最少者(同次数淘汰最久未用),保留高频词
+    int min_idx = 0;
+    for (int i = 1; i < G_USER_COUNT; i++) {
+      if (G_USER_WORDS[i].count < G_USER_WORDS[min_idx].count ||
+          (G_USER_WORDS[i].count == G_USER_WORDS[min_idx].count &&
+           G_USER_WORDS[i].last_used < G_USER_WORDS[min_idx].last_used))
+        min_idx = i;
     }
-    strncpy(G_RECENT_WORDS[oldest_idx].word, word, 63);
-    G_RECENT_WORDS[oldest_idx].word[63] = '\0';
-    G_RECENT_WORDS[oldest_idx].count = 1;
-    G_RECENT_WORDS[oldest_idx].last_used = now_ms;
+    idx = min_idx;
   }
+  strncpy(G_USER_WORDS[idx].word, word, 63);
+  G_USER_WORDS[idx].word[63] = '\0';
+  G_USER_WORDS[idx].count = 1;
+  G_USER_WORDS[idx].last_used = now_epoch;
+  G_USERFREQ_DIRTY = true;
 }
 
-static int get_recent_count(const char *word) {
-  for (int i = 0; i < G_RECENT_COUNT; i++) {
-    if (strcmp(G_RECENT_WORDS[i].word, word) == 0)
-      return G_RECENT_WORDS[i].count;
+static void user_freq_save(void) {
+  if (!G_USERFREQ_PATH[0] || !G_USERFREQ_DIRTY)
+    return;
+  char tmp[600];
+  snprintf(tmp, sizeof(tmp), "%s.tmp", G_USERFREQ_PATH);
+  FILE *f = fopen(tmp, "w");
+  if (!f)
+    return;
+  for (int i = 0; i < G_USER_COUNT; i++)
+    fprintf(f, "%s %d %llu\n", G_USER_WORDS[i].word, G_USER_WORDS[i].count,
+            (unsigned long long)G_USER_WORDS[i].last_used);
+  fclose(f);
+  rename(tmp, G_USERFREQ_PATH);
+  G_USERFREQ_DIRTY = false;
+}
+
+static void user_freq_load(const char *path) {
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return;
+  char line[128];
+  uint64_t now_epoch = get_epoch_sec();
+  while (G_USER_COUNT < MAX_USER_WORDS && fgets(line, sizeof(line), f)) {
+    char word[64];
+    int count;
+    unsigned long long last = 0;
+    // 兼容旧格式 "词 次数"(无时间戳),视为刚使用不衰减
+    if (sscanf(line, "%63s %d %llu", word, &count, &last) >= 2 &&
+        count > 0) {
+      if (last != 0 && now_epoch > last) {
+        // 半衰期指数衰减:每过 HALF_LIFE 时间,权重折半
+        uint64_t elapsed = now_epoch - last;
+        int half_lives = (int)(elapsed / USERFREQ_HALF_LIFE_SEC);
+        for (int i = 0; i < half_lives && count > 1; i++)
+          count >>= 1;
+      }
+      strncpy(G_USER_WORDS[G_USER_COUNT].word, word, 63);
+      G_USER_WORDS[G_USER_COUNT].word[63] = '\0';
+      G_USER_WORDS[G_USER_COUNT].count = count;
+      G_USER_WORDS[G_USER_COUNT].last_used = last ? last : now_epoch;
+      G_USER_COUNT++;
+    }
   }
-  return 0;
+  fclose(f);
 }
 
 static void clear_preedit(struct ime_state *s) {
@@ -130,6 +197,8 @@ static void reset_state(struct ime_state *s) {
   s->full_match_count = 0;
   s->total = 0;
   s->page = 0;
+  s->preview_idx = 0;
+  s->box_shown = false;
 }
 
 static char evdev_to_char(uint32_t key) {
@@ -159,6 +228,7 @@ static void compute_candidates(struct ime_state *s) {
     return;
 
   if (s->buf_len % 2 == 0) {
+    // 偶数位:完整编码精确匹配(完整词)+ 首音节单字
     int full_hits = dict_lookup(s->buffer, s->buf_len, s->cand_ptrs, MAX_CANDS);
     s->full_match_count = full_hits;
     s->total = full_hits;
@@ -183,59 +253,72 @@ static void compute_candidates(struct ime_state *s) {
       }
     }
   } else {
-    if (s->buf_len == 1) {
-      int exact_hits = dict_lookup(s->buffer, 1, s->cand_ptrs, MAX_CANDS);
-      s->total = exact_hits;
-      s->full_match_count = exact_hits;
-      for (int i = 0; i < exact_hits; i++)
-        s->cand_is_full[i] = true;
-      int idx = dict_prefix_lower(s->buffer, 1);
-      if (idx >= 0) {
-        for (int i = 0; i < MAX_CANDS && (idx + i) < (int)G_DICT.entry_count &&
-                        s->total < MAX_CANDS;
-             i++) {
-          const DictCodeEntry *e = &G_DICT.entries[idx + i];
-          const char *code = G_DICT.code_pool + e->code_offset;
-          if (e->code_length >= 1 && code[0] == s->buffer[0]) {
-            if (e->code_length == 1)
-              continue;
-            if (e->word_count > 0) {
-              for (int k = 0; k < e->word_count && s->total < MAX_CANDS; k++) {
-                const char *w =
-                    G_DICT.word_pool + G_DICT.word_offsets[e->word_start + k];
-                bool dup = false;
-                for (int j = 0; j < s->total; j++) {
-                  if (strcmp(s->cand_ptrs[j], w) == 0) {
-                    dup = true;
-                    break;
-                  }
-                }
-                if (!dup) {
-                  s->cand_ptrs[s->total] = w;
-                  s->cand_is_full[s->total] = false;
-                  s->total++;
-                  break;
-                }
-              }
-            }
-          } else
+    // 奇数位:双拼编码必为偶数,此处 buffer 只能是某个编码的前缀。
+    // 已完成音节(上一偶数位)的候选已经展示过,这里只做整串前缀联想,
+    // 让进行中的音节参与候选(如 "nih" 关联到 nihc→你好)。
+    // 扫描所有匹配编码,每个取最高频词,按全局词频取前 MAX_CANDS。
+    // 结合用户持久化词频:用户真正用过的词优先于静态语料词频。
+    // 字数上限规则:预测不能超过编码当前可表示的最大信息量。
+    // 2 字母 = 1 音节 = 1 字,奇数 buf_len 只完成了部分音节,
+    // 预测词字数上限 = (buf_len+1)/2,即联想编码长度 <= buf_len+1。
+    // 例:1 码只预览单字,3 码最多 2 字词,5 码最多 3 字词。
+    const char *tmp_words[MAX_CANDS];
+    int64_t tmp_freqs[MAX_CANDS];
+    int tmp_count = 0;
+    int idx = dict_prefix_lower(s->buffer, s->buf_len);
+    if (idx >= 0) {
+      for (int i = idx; i < (int)G_DICT.entry_count; i++) {
+        const DictCodeEntry *e = &G_DICT.entries[i];
+        const char *code = G_DICT.code_pool + e->code_offset;
+        if (e->code_length < s->buf_len)
+          break;
+        if (memcmp(code, s->buffer, s->buf_len) != 0)
+          break;
+        if (e->code_length == s->buf_len)
+          continue;
+        if (e->code_length > s->buf_len + 1)
+          continue;
+        if (e->word_count <= 0)
+          continue;
+        const char *w = G_DICT.word_pool + G_DICT.word_offsets[e->word_start];
+        int64_t f = (int64_t)get_user_count(w) * USERFREQ_BOOST +
+                    dict_word_freq(e->word_start);
+        if (tmp_count == MAX_CANDS && f <= tmp_freqs[MAX_CANDS - 1])
+          continue;
+        bool dup = false;
+        for (int j = 0; j < tmp_count; j++) {
+          if (strcmp(tmp_words[j], w) == 0) {
+            dup = true;
             break;
+          }
         }
+        if (dup)
+          continue;
+        int j = tmp_count;
+        while (j > 0 && tmp_freqs[j - 1] < f)
+          j--;
+        if (tmp_count < MAX_CANDS)
+          tmp_count++;
+        for (int k = tmp_count - 1; k > j; k--) {
+          tmp_words[k] = tmp_words[k - 1];
+          tmp_freqs[k] = tmp_freqs[k - 1];
+        }
+        tmp_words[j] = w;
+        tmp_freqs[j] = f;
       }
-    } else {
-      int full_hits =
-          dict_lookup(s->buffer, s->buf_len - 1, s->cand_ptrs, MAX_CANDS);
-      s->full_match_count = 0;
-      s->total = full_hits;
-      for (int i = 0; i < full_hits; i++)
-        s->cand_is_full[i] = false;
     }
+    for (int i = 0; i < tmp_count; i++) {
+      s->cand_ptrs[i] = tmp_words[i];
+      s->cand_is_full[i] = false;
+    }
+    s->total = tmp_count;
+    s->full_match_count = 0;
   }
 
   if (s->total > 1) {
     int score[MAX_CANDS];
     for (int i = 0; i < s->total; i++)
-      score[i] = get_recent_count(s->cand_ptrs[i]);
+      score[i] = get_user_count(s->cand_ptrs[i]);
     for (int i = 1; i < s->total; i++) {
       const char *tmp = s->cand_ptrs[i];
       bool tmp_full = s->cand_is_full[i];
@@ -275,36 +358,61 @@ static void update_preedit(struct ime_state *s) {
     return;
   }
   compute_candidates(s);
+
+  if (s->preview_idx >= s->total)
+    s->preview_idx = (s->total > 0) ? s->total - 1 : 0;
+  if (s->preview_idx < 0)
+    s->preview_idx = 0;
+
+  // 隐藏模式为默认:首项候选直接作 preedit,用 -/= 逐个预览。
+  // 预览到第 6 个(超过 5 个)仍未命中时,自动弹出候选框。
+  s->box_shown = (s->preview_idx >= BOX_BASE);
+
   char text[512] = {0};
-  size_t pos = snprintf(text, sizeof(text), "[%s] ", s->buffer);
-  if (s->total > 0) {
-    int start = s->page * PAGE_SIZE;
+  // 无光标选区(0,0):避免应用把 preedit 渲染成高亮/下划线选框。
+  // 需要时可由光标位置定位,但目前不框选任何内容。
+  uint32_t cursor_start = 0, cursor_end = 0;
+
+  if (s->box_shown) {
+    // 预览超过 5 个仍未命中:弹出候选框,从第 6 个(未选中的下一项)连贯继续。
+    // 分页以 BOX_BASE(第 6 个,下标 5)为基准,不重复显示已看过的 1-5。
+    size_t pos = snprintf(text, sizeof(text), "[%s] ", s->buffer);
+    s->page = (s->preview_idx - BOX_BASE) / PAGE_SIZE;
+    int start = BOX_BASE + s->page * PAGE_SIZE;
     int end = start + PAGE_SIZE;
     if (end > s->total)
       end = s->total;
-    int pages = (s->total + PAGE_SIZE - 1) / PAGE_SIZE;
+    int pages = (s->total - BOX_BASE + PAGE_SIZE - 1) / PAGE_SIZE;
     for (int i = start; i < end; i++) {
       const char *c = get_candidate(s, i);
-      if (c)
+      if (c) {
         pos += snprintf(text + pos, sizeof(text) - pos, "%d.%s ", i - start + 1,
                         c);
+      }
     }
     if (pages > 1)
       pos += snprintf(text + pos, sizeof(text) - pos, "(%d/%d)", s->page + 1,
                       pages);
+  } else {
+    // 隐藏模式：只显示当前预览的首项候选，无编码、无候选列表
+    if (s->total > 0) {
+      snprintf(text, sizeof(text), "%s", s->cand_ptrs[s->preview_idx]);
+    } else {
+      snprintf(text, sizeof(text), "%s", s->buffer);
+    }
   }
-  uint32_t len = strlen(text);
-  zwp_input_method_v2_set_preedit_string(s->input_method, text, 0, len);
+
+  zwp_input_method_v2_set_preedit_string(s->input_method, text, cursor_start,
+                                         cursor_end);
   zwp_input_method_v2_commit(s->input_method, s->current_serial);
   wl_display_flush(s->display);
 }
 
-static void commit_candidate(struct ime_state *s, int page_idx) {
-  int real_idx = s->page * PAGE_SIZE + page_idx;
+static void commit_candidate_at(struct ime_state *s, int real_idx) {
   const char *t = get_candidate(s, real_idx);
   if (!t)
     return;
-  record_recent_word(t, get_time_ms());
+  record_user_word(t, get_epoch_sec());
   zwp_input_method_v2_commit_string(s->input_method, t);
   bool is_full = (real_idx < s->total) ? s->cand_is_full[real_idx] : false;
   if (is_full || s->buf_len <= 2) {
@@ -314,6 +422,7 @@ static void commit_candidate(struct ime_state *s, int page_idx) {
     memmove(s->buffer, s->buffer + 2, s->buf_len - 2 + 1);
     s->buf_len -= 2;
     s->page = 0;
+    s->preview_idx = 0;
     update_preedit(s);
   }
 }
@@ -398,7 +507,7 @@ static void handle_grab_key(void *data,
         }
         s->mode_ascii = !s->mode_ascii;
         if (!s->mode_ascii) {
-          zwp_input_method_v2_set_preedit_string(s->input_method, "[zh]", 0, 4);
+          zwp_input_method_v2_set_preedit_string(s->input_method, "[zh]", 0, 0);
           zwp_input_method_v2_commit(s->input_method, s->current_serial);
           s->zh_indicator_active = true;
           s->zh_indicator_time = get_time_ms();
@@ -464,7 +573,7 @@ static void handle_grab_key(void *data,
       consume = true;
       if (pressed) {
         if (composing && s->total > 0)
-          commit_candidate(s, 0);
+          commit_candidate_at(s, s->preview_idx);
         zwp_input_method_v2_commit_string(s->input_method, punct_str);
         clear_preedit(s);
       }
@@ -484,6 +593,7 @@ static void handle_grab_key(void *data,
       s->buffer[s->buf_len++] = c;
       s->buffer[s->buf_len] = '\0';
       s->page = 0;
+      s->preview_idx = 0;
       update_preedit(s);
     }
   }
@@ -492,21 +602,21 @@ static void handle_grab_key(void *data,
     consume = true;
     if (pressed) {
       if (s->total > 0)
-        commit_candidate(s, 0);
+        commit_candidate_at(s, s->preview_idx);
       else {
         zwp_input_method_v2_commit_string(s->input_method, s->buffer);
         clear_composing(s);
       }
     }
   }
-  // C. 数字键 1-3
-  else if (key >= KEY_1 && key <= KEY_3 && composing) {
+  // C. 数字键 1-3（仅候选框弹出时）
+  else if (key >= KEY_1 && key <= KEY_3 && composing && s->box_shown) {
     consume = true;
     if (pressed) {
       int idx = key - KEY_1;
-      int real = s->page * PAGE_SIZE + idx;
+      int real = BOX_BASE + s->page * PAGE_SIZE + idx;
       if (real < s->total)
-        commit_candidate(s, idx);
+        commit_candidate_at(s, real);
     }
   }
   // D. 退格：Press 立即删一字 + arm timerfd, Release 停 timerfd
@@ -518,6 +628,7 @@ static void handle_grab_key(void *data,
         s->buf_len--;
         s->buffer[s->buf_len] = '\0';
         s->page = 0;
+        s->preview_idx = 0;
         update_preedit(s);
       }
       uint64_t interval_ns =
@@ -541,32 +652,61 @@ static void handle_grab_key(void *data,
     if (pressed)
       clear_composing(s);
   }
-  // F. 翻页下一页
-  else if ((key == KEY_EQUAL || key == KEY_DOT || key == KEY_PAGEDOWN ||
-            key == KEY_DOWN) &&
-           composing && s->total > 0) {
+  // F. = 预览下一个候选;候选框展开后翻页下一页
+  else if (key == KEY_EQUAL && composing && s->total > 0) {
     consume = true;
     if (pressed) {
-      int pages = (s->total + PAGE_SIZE - 1) / PAGE_SIZE;
-      if (s->page + 1 < pages) {
-        s->page++;
+      if (s->box_shown) {
+        int pages = (s->total - BOX_BASE + PAGE_SIZE - 1) / PAGE_SIZE;
+        if (s->page + 1 < pages) {
+          s->preview_idx = BOX_BASE + (s->page + 1) * PAGE_SIZE;
+          update_preedit(s);
+        }
+      } else if (s->preview_idx + 1 < s->total) {
+        s->preview_idx++;
         update_preedit(s);
       }
     }
   }
-  // G. 翻页上一页
-  else if ((key == KEY_MINUS || key == KEY_COMMA || key == KEY_PAGEUP ||
-            key == KEY_UP) &&
-           composing && s->total > 0) {
+  // G. - 预览上一个候选;候选框展开后翻页上一页
+  else if (key == KEY_MINUS && composing && s->total > 0) {
+    consume = true;
+    if (pressed) {
+      if (s->box_shown) {
+        if (s->page > 0) {
+          s->preview_idx = BOX_BASE + (s->page - 1) * PAGE_SIZE;
+          update_preedit(s);
+        }
+      } else if (s->preview_idx > 0) {
+        s->preview_idx--;
+        update_preedit(s);
+      }
+    }
+  }
+  // H. 翻页下一页（候选框模式）
+  else if ((key == KEY_PAGEDOWN || key == KEY_DOWN) && composing &&
+           s->box_shown && s->total > 0) {
+    consume = true;
+    if (pressed) {
+      int pages = (s->total - BOX_BASE + PAGE_SIZE - 1) / PAGE_SIZE;
+      if (s->page + 1 < pages) {
+        s->preview_idx = BOX_BASE + (s->page + 1) * PAGE_SIZE;
+        update_preedit(s);
+      }
+    }
+  }
+  // I. 翻页上一页（候选框模式）
+  else if ((key == KEY_PAGEUP || key == KEY_UP) && composing &&
+           s->box_shown && s->total > 0) {
     consume = true;
     if (pressed) {
       if (s->page > 0) {
-        s->page--;
+        s->preview_idx = BOX_BASE + (s->page - 1) * PAGE_SIZE;
         update_preedit(s);
       }
     }
   }
-  // H. Enter
+  // J. Enter
   else if (key == KEY_ENTER && composing) {
     consume = true;
     if (pressed) {
@@ -710,6 +850,9 @@ int main(int argc, char *argv[]) {
     if (slash) {
       strcpy(slash + 1, "xiaohe.dict");
       dict_ok = dict_load(dict_path);
+      strcpy(slash + 1, "xiaohe.userfreq");
+      snprintf(G_USERFREQ_PATH, sizeof(G_USERFREQ_PATH), "%s", dict_path);
+      user_freq_load(G_USERFREQ_PATH);
     }
   }
 
@@ -722,6 +865,8 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "cannot load xiaohe.dict\n");
     return 1;
   }
+
+  G_LAST_SAVE_MS = get_time_ms();
 
   struct ime_state s = {0};
   s.mode_ascii = true;
@@ -799,12 +944,24 @@ int main(int argc, char *argv[]) {
         s.buf_len--;
         s.buffer[s.buf_len] = '\0';
         s.page = 0;
+        s.preview_idx = 0;
         update_preedit(&s);
+      }
+    }
+
+    // 用户词频定时落盘(最多每 5 秒一次)
+    if (G_USERFREQ_DIRTY) {
+      uint64_t now = get_time_ms();
+      if (now - G_LAST_SAVE_MS >= 5000) {
+        user_freq_save();
+        G_LAST_SAVE_MS = now;
       }
     }
   }
 
   s.running = false;
+
+  user_freq_save();
 
   if (s.repeat_timer_fd >= 0)
     close(s.repeat_timer_fd);
