@@ -10,7 +10,7 @@ import os
 import struct
 from collections import defaultdict
 
-MAGIC = 0x58484430  # "XHD0"
+MAGIC = 0x58484431  # "XHD1" (v2: 新增全局词频数组 word_freqs)
 MAX_CANDIDATES = 30
 
 
@@ -126,11 +126,12 @@ def parse_dictionary(filepath):
                     if word in entries[code]:
                         entries[code].remove(word)
                     entries[code].insert(0, word)
+                    freq_map[word] = 2000000000  # 用户词库全局最高优先
 
-    return entries
+    return entries, freq_map
 
 
-def generate_binary(entries, bin_path):
+def generate_binary(entries, freq_map, bin_path):
     sorted_codes = sorted(entries.keys())
     total = len(sorted_codes)
 
@@ -139,6 +140,7 @@ def generate_binary(entries, bin_path):
 
     word_pool = bytearray()
     word_offsets = []
+    word_freqs = []
 
     for code in sorted_codes:
         code_offset = len(code_pool)
@@ -154,6 +156,8 @@ def generate_binary(entries, bin_path):
             word_pool.extend(w.encode("utf-8"))
             word_pool.append(0)
             word_offsets.append(off)
+            freq = freq_map.get(w, 0)
+            word_freqs.append(max(0, min(freq, 0x7FFFFFFF)))
 
         code_entries.append((code_offset, code_length, word_start, word_count))
 
@@ -174,7 +178,7 @@ def generate_binary(entries, bin_path):
                 len(code_pool),
                 len(word_pool),
                 len(word_offsets),
-                0,
+                len(word_freqs),
             )
         )
 
@@ -186,6 +190,9 @@ def generate_binary(entries, bin_path):
 
         for off in word_offsets:
             f.write(struct.pack("<i", off))
+
+        for fr in word_freqs:
+            f.write(struct.pack("<i", fr))
 
     return total, len(code_pool), len(word_pool), len(word_offsets)
 
@@ -200,7 +207,7 @@ def main():
         sys.exit(1)
 
     print("parsing dictionary", file=sys.stderr)
-    entries = parse_dictionary(dict_txt)
+    entries, freq_map = parse_dictionary(dict_txt)
     total_words = sum(len(v) for v in entries.values())
     print(
         f"  {len(entries)} unique encodes, {total_words} candidate words",
@@ -208,7 +215,7 @@ def main():
     )
 
     print("generating xiaohe.dict", file=sys.stderr)
-    n, cp, wp, wo = generate_binary(entries, dict_bin)
+    n, cp, wp, wo = generate_binary(entries, freq_map, dict_bin)
     bin_size = os.path.getsize(dict_bin)
     print(
         f"{n} items, encode pool {cp} byte, candiate words pool {wp} byte",

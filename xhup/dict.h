@@ -11,7 +11,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#define DICT_MAGIC 0x58484430
+#define DICT_MAGIC 0x58484431
 #define DICT_MAX_CANDIDATES 30
 
 typedef struct {
@@ -20,7 +20,7 @@ typedef struct {
     uint32_t code_pool_size;
     uint32_t word_pool_size;
     uint32_t word_offsets_count;
-    uint32_t reserved;
+    uint32_t word_freqs_count;
 } DictHeader;
 
 typedef struct {
@@ -39,6 +39,7 @@ typedef struct {
     const char *code_pool;
     const char *word_pool;
     const int32_t *word_offsets;
+    const int32_t *word_freqs;
 } Dict;
 
 static Dict G_DICT = {0};
@@ -76,6 +77,9 @@ static inline bool dict_load(const char *path) {
     ptr += hdr->word_pool_size;
 
     G_DICT.word_offsets = (const int32_t *)ptr;
+    ptr += sizeof(int32_t) * hdr->word_offsets_count;
+
+    G_DICT.word_freqs = (const int32_t *)ptr;
 
     return true;
 }
@@ -144,6 +148,12 @@ static inline int dict_prefix_lower(const char *prefix, int prefix_len) {
 
 static inline bool dict_has_prefix(const char *prefix, int prefix_len) {
     return dict_prefix_lower(prefix, prefix_len) >= 0;
+}
+
+static inline int32_t dict_word_freq(int word_idx) {
+    if (!G_DICT.word_freqs)
+        return 0;
+    return G_DICT.word_freqs[word_idx];
 }
 
 #endif /* DICT_H */

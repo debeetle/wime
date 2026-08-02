@@ -15,6 +15,8 @@
 #include <wayland-client.h>
 
 #define MAX_CANDS 30
+#define PAGE_SIZE 3
+#define BOX_BASE 5
 
 struct ime_state {
   struct wl_display *display;
@@ -38,6 +40,8 @@ struct ime_state {
   int full_match_count;
   int total;
   int page;
+  int preview_idx;
+  bool box_shown;
 
   // 模式与标点
   bool mode_ascii;
@@ -72,8 +76,6 @@ static uint64_t get_epoch_sec(void) {
   clock_gettime(CLOCK_REALTIME, &ts);
   return (uint64_t)ts.tv_sec;
 }
-
-#define PAGE_SIZE 3
 
 // --- 用户词频(持久化,学习真实输入习惯) ---
 // 静态词典词频是构建时烘焙的语料频率,不会随使用更新。
@@ -195,6 +197,8 @@ static void reset_state(struct ime_state *s) {
   s->full_match_count = 0;
   s->total = 0;
   s->page = 0;
+  s->preview_idx = 0;
+  s->box_shown = false;
 }
 
 static char evdev_to_char(uint32_t key) {
@@ -224,6 +228,7 @@ static void compute_candidates(struct ime_state *s) {
     return;
 
   if (s->buf_len % 2 == 0) {
+    // 偶数位:完整编码精确匹配(完整词)+ 首音节单字
     int full_hits = dict_lookup(s->buffer, s->buf_len, s->cand_ptrs, MAX_CANDS);
     s->full_match_count = full_hits;
     s->total = full_hits;
@@ -251,12 +256,12 @@ static void compute_candidates(struct ime_state *s) {
     // 奇数位:双拼编码必为偶数,此处 buffer 只能是某个编码的前缀。
     // 已完成音节(上一偶数位)的候选已经展示过,这里只做整串前缀联想,
     // 让进行中的音节参与候选(如 "nih" 关联到 nihc→你好)。
+    // 扫描所有匹配编码,每个取最高频词,按全局词频取前 MAX_CANDS。
+    // 结合用户持久化词频:用户真正用过的词优先于静态语料词频。
     // 字数上限规则:预测不能超过编码当前可表示的最大信息量。
     // 2 字母 = 1 音节 = 1 字,奇数 buf_len 只完成了部分音节,
     // 预测词字数上限 = (buf_len+1)/2,即联想编码长度 <= buf_len+1。
     // 例:1 码只预览单字,3 码最多 2 字词,5 码最多 3 字词。
-    // 扫描所有匹配编码,每个取最高频词,按用户持久化词频取前 MAX_CANDS
-    // (XHD0 无静态词频数组,用户词频即唯一排序依据;从未用过的词按编码序)。
     const char *tmp_words[MAX_CANDS];
     int64_t tmp_freqs[MAX_CANDS];
     int tmp_count = 0;
@@ -276,7 +281,8 @@ static void compute_candidates(struct ime_state *s) {
         if (e->word_count <= 0)
           continue;
         const char *w = G_DICT.word_pool + G_DICT.word_offsets[e->word_start];
-        int64_t f = (int64_t)get_user_count(w) * USERFREQ_BOOST;
+        int64_t f = (int64_t)get_user_count(w) * USERFREQ_BOOST +
+                    dict_word_freq(e->word_start);
         if (tmp_count == MAX_CANDS && f <= tmp_freqs[MAX_CANDS - 1])
           continue;
         bool dup = false;
@@ -306,6 +312,7 @@ static void compute_candidates(struct ime_state *s) {
       s->cand_is_full[i] = false;
     }
     s->total = tmp_count;
+    s->full_match_count = 0;
   }
 
   if (s->total > 1) {
@@ -351,31 +358,57 @@ static void update_preedit(struct ime_state *s) {
     return;
   }
   compute_candidates(s);
+
+  if (s->preview_idx >= s->total)
+    s->preview_idx = (s->total > 0) ? s->total - 1 : 0;
+  if (s->preview_idx < 0)
+    s->preview_idx = 0;
+
+  // 隐藏模式为默认:首项候选直接作 preedit,用 -/= 逐个预览。
+  // 预览到第 6 个(超过 5 个)仍未命中时,自动弹出候选框。
+  s->box_shown = (s->preview_idx >= BOX_BASE);
+
   char text[512] = {0};
-  size_t pos = snprintf(text, sizeof(text), "[%s] ", s->buffer);
-  if (s->total > 0) {
-    int start = s->page * PAGE_SIZE;
+  // 无光标选区(0,0):避免应用把 preedit 渲染成高亮/下划线选框。
+  // 需要时可由光标位置定位,但目前不框选任何内容。
+  uint32_t cursor_start = 0, cursor_end = 0;
+
+  if (s->box_shown) {
+    // 预览超过 5 个仍未命中:弹出候选框,从第 6 个(未选中的下一项)连贯继续。
+    // 分页以 BOX_BASE(第 6 个,下标 5)为基准,不重复显示已看过的 1-5。
+    size_t pos = snprintf(text, sizeof(text), "[%s] ", s->buffer);
+    s->page = (s->preview_idx - BOX_BASE) / PAGE_SIZE;
+    int start = BOX_BASE + s->page * PAGE_SIZE;
     int end = start + PAGE_SIZE;
     if (end > s->total)
       end = s->total;
-    int pages = (s->total + PAGE_SIZE - 1) / PAGE_SIZE;
+    int pages = (s->total - BOX_BASE + PAGE_SIZE - 1) / PAGE_SIZE;
     for (int i = start; i < end; i++) {
       const char *c = get_candidate(s, i);
-      if (c)
+      if (c) {
         pos += snprintf(text + pos, sizeof(text) - pos, "%d.%s ", i - start + 1,
                         c);
+      }
     }
     if (pages > 1)
       pos += snprintf(text + pos, sizeof(text) - pos, "(%d/%d)", s->page + 1,
                       pages);
+  } else {
+    // 隐藏模式：只显示当前预览的首项候选，无编码、无候选列表
+    if (s->total > 0) {
+      snprintf(text, sizeof(text), "%s", s->cand_ptrs[s->preview_idx]);
+    } else {
+      snprintf(text, sizeof(text), "%s", s->buffer);
+    }
   }
-  zwp_input_method_v2_set_preedit_string(s->input_method, text, 0, 0);
+
+  zwp_input_method_v2_set_preedit_string(s->input_method, text, cursor_start,
+                                         cursor_end);
   zwp_input_method_v2_commit(s->input_method, s->current_serial);
   wl_display_flush(s->display);
 }
 
-static void commit_candidate(struct ime_state *s, int page_idx) {
-  int real_idx = s->page * PAGE_SIZE + page_idx;
+static void commit_candidate_at(struct ime_state *s, int real_idx) {
   const char *t = get_candidate(s, real_idx);
   if (!t)
     return;
@@ -389,6 +422,7 @@ static void commit_candidate(struct ime_state *s, int page_idx) {
     memmove(s->buffer, s->buffer + 2, s->buf_len - 2 + 1);
     s->buf_len -= 2;
     s->page = 0;
+    s->preview_idx = 0;
     update_preedit(s);
   }
 }
@@ -539,7 +573,7 @@ static void handle_grab_key(void *data,
       consume = true;
       if (pressed) {
         if (composing && s->total > 0)
-          commit_candidate(s, 0);
+          commit_candidate_at(s, s->preview_idx);
         zwp_input_method_v2_commit_string(s->input_method, punct_str);
         clear_preedit(s);
       }
@@ -559,6 +593,7 @@ static void handle_grab_key(void *data,
       s->buffer[s->buf_len++] = c;
       s->buffer[s->buf_len] = '\0';
       s->page = 0;
+      s->preview_idx = 0;
       update_preedit(s);
     }
   }
@@ -567,21 +602,21 @@ static void handle_grab_key(void *data,
     consume = true;
     if (pressed) {
       if (s->total > 0)
-        commit_candidate(s, 0);
+        commit_candidate_at(s, s->preview_idx);
       else {
         zwp_input_method_v2_commit_string(s->input_method, s->buffer);
         clear_composing(s);
       }
     }
   }
-  // C. 数字键 1-3
-  else if (key >= KEY_1 && key <= KEY_3 && composing) {
+  // C. 数字键 1-3（仅候选框弹出时）
+  else if (key >= KEY_1 && key <= KEY_3 && composing && s->box_shown) {
     consume = true;
     if (pressed) {
       int idx = key - KEY_1;
-      int real = s->page * PAGE_SIZE + idx;
+      int real = BOX_BASE + s->page * PAGE_SIZE + idx;
       if (real < s->total)
-        commit_candidate(s, idx);
+        commit_candidate_at(s, real);
     }
   }
   // D. 退格：Press 立即删一字 + arm timerfd, Release 停 timerfd
@@ -593,6 +628,7 @@ static void handle_grab_key(void *data,
         s->buf_len--;
         s->buffer[s->buf_len] = '\0';
         s->page = 0;
+        s->preview_idx = 0;
         update_preedit(s);
       }
       uint64_t interval_ns =
@@ -616,30 +652,61 @@ static void handle_grab_key(void *data,
     if (pressed)
       clear_composing(s);
   }
-  // F. 翻页下一页
-  else if ((key == KEY_EQUAL || key == KEY_PAGEDOWN || key == KEY_DOWN) &&
-           composing && s->total > 0) {
+  // F. = 预览下一个候选;候选框展开后翻页下一页
+  else if (key == KEY_EQUAL && composing && s->total > 0) {
     consume = true;
     if (pressed) {
-      int pages = (s->total + PAGE_SIZE - 1) / PAGE_SIZE;
-      if (s->page + 1 < pages) {
-        s->page++;
+      if (s->box_shown) {
+        int pages = (s->total - BOX_BASE + PAGE_SIZE - 1) / PAGE_SIZE;
+        if (s->page + 1 < pages) {
+          s->preview_idx = BOX_BASE + (s->page + 1) * PAGE_SIZE;
+          update_preedit(s);
+        }
+      } else if (s->preview_idx + 1 < s->total) {
+        s->preview_idx++;
         update_preedit(s);
       }
     }
   }
-  // G. 翻页上一页
-  else if ((key == KEY_MINUS || key == KEY_PAGEUP || key == KEY_UP) &&
-           composing && s->total > 0) {
+  // G. - 预览上一个候选;候选框展开后翻页上一页
+  else if (key == KEY_MINUS && composing && s->total > 0) {
+    consume = true;
+    if (pressed) {
+      if (s->box_shown) {
+        if (s->page > 0) {
+          s->preview_idx = BOX_BASE + (s->page - 1) * PAGE_SIZE;
+          update_preedit(s);
+        }
+      } else if (s->preview_idx > 0) {
+        s->preview_idx--;
+        update_preedit(s);
+      }
+    }
+  }
+  // H. 翻页下一页（候选框模式）
+  else if ((key == KEY_PAGEDOWN || key == KEY_DOWN) && composing &&
+           s->box_shown && s->total > 0) {
+    consume = true;
+    if (pressed) {
+      int pages = (s->total - BOX_BASE + PAGE_SIZE - 1) / PAGE_SIZE;
+      if (s->page + 1 < pages) {
+        s->preview_idx = BOX_BASE + (s->page + 1) * PAGE_SIZE;
+        update_preedit(s);
+      }
+    }
+  }
+  // I. 翻页上一页（候选框模式）
+  else if ((key == KEY_PAGEUP || key == KEY_UP) && composing &&
+           s->box_shown && s->total > 0) {
     consume = true;
     if (pressed) {
       if (s->page > 0) {
-        s->page--;
+        s->preview_idx = BOX_BASE + (s->page - 1) * PAGE_SIZE;
         update_preedit(s);
       }
     }
   }
-  // H. Enter
+  // J. Enter
   else if (key == KEY_ENTER && composing) {
     consume = true;
     if (pressed) {
@@ -877,6 +944,7 @@ int main(int argc, char *argv[]) {
         s.buf_len--;
         s.buffer[s.buf_len] = '\0';
         s.page = 0;
+        s.preview_idx = 0;
         update_preedit(&s);
       }
     }
