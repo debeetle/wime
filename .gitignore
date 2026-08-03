@@ -1,20 +1,16 @@
 # 编译产物
-xiaohe
+/xiaohe/xhfly/xhfly
+/xiaohe/xhup/xhup
 
 # 词典构建产物(由 gen_dict.py 生成)
-xiaohe.dict
+/xiaohe/xhfly/xhfly.dict
+/xiaohe/xhup/xhup.dict
 
 # wayland-scanner 生成代码
 *-client-protocol.h
 *-protocol.h
 *-protocol.c
 
-# Python 字节码
-__pycache__/
-*.pyc
-
 # 运行时用户词频(持久化学习数据,不入库)
-xiaohe.userfreq
-
-# opencode 会话恢复临时文件
-continue
+/xiaohe/xhfly/xhfly.userfreq
+/xiaohe/xhup/xhup.userfreq
