@@ -6,6 +6,7 @@
 #include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +52,8 @@ struct ime_state {
   int shift_count;
   bool shift_combo;
   bool key_passthrough_pressed[256];
+  // 被输入法消费(未透传)的按键;按下时置位,用于消费配对的 Release
+  bool key_consumed_pressed[256];
   bool punct_fullwidth;
   bool double_quote_open;
   bool single_quote_open;
@@ -258,6 +261,24 @@ static void reset_state(struct ime_state *s) {
   s->cand_cache_valid = false;
 }
 
+// 安全追加格式化文本:cap 为缓冲区总容量,pos 一旦到达 cap 就不再写入,
+// 避免 snprintf 返回值超过剩余大小时出现指针越界/长度下溢。
+static size_t preedit_append(char *buf, size_t cap, size_t pos,
+                             const char *fmt, ...) {
+  if (pos >= cap)
+    return cap;
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf + pos, cap - pos, fmt, ap);
+  va_end(ap);
+  if (n < 0)
+    return pos;
+  size_t add = (size_t)n;
+  if (add >= cap - pos)
+    return cap; // 已截断:后续调用不再写入
+  return pos + add;
+}
+
 static char evdev_to_char(uint32_t key) {
   if (key >= KEY_Q && key <= KEY_P)
     return "qwertyuiop"[key - KEY_Q];
@@ -426,7 +447,7 @@ static void update_preedit(struct ime_state *s) {
   }
   compute_candidates(s);
   char text[512] = {0};
-  size_t pos = snprintf(text, sizeof(text), "[%s] ", s->buffer);
+  size_t pos = preedit_append(text, sizeof(text), 0, "[%s] ", s->buffer);
   if (s->total > 0) {
     int start = s->page * PAGE_SIZE;
     int end = start + PAGE_SIZE;
@@ -436,12 +457,11 @@ static void update_preedit(struct ime_state *s) {
     for (int i = start; i < end; i++) {
       const char *c = get_candidate(s, i);
       if (c)
-        pos += snprintf(text + pos, sizeof(text) - pos, "%d.%s ", i - start + 1,
-                        c);
+        pos = preedit_append(text, sizeof(text), pos, "%d.%s ", i - start + 1,
+                             c);
     }
     if (pages > 1)
-      pos += snprintf(text + pos, sizeof(text) - pos, "(%d/%d)", s->page + 1,
-                      pages);
+      preedit_append(text, sizeof(text), pos, "(%d/%d)", s->page + 1, pages);
   }
   // 无光标选区(0,0):避免应用把 preedit 渲染成高亮/下划线选框。
   zwp_input_method_v2_set_preedit_string(s->input_method, text, 0, 0);
@@ -495,8 +515,6 @@ static void handle_grab_key(void *data,
   struct ime_state *s = data;
   bool pressed = (key_state == 1);
   bool shift = (s->active_mods & 0x01) != 0;
-  bool ctrl = (s->active_mods & 0x04) != 0;
-  bool alt = (s->active_mods & 0x08) != 0;
 
   char c = evdev_to_char(key);
   bool composing = (s->buf_len > 0);
@@ -508,15 +526,32 @@ static void handle_grab_key(void *data,
     return;
   }
 
+  // 0.1 之前被输入法消费的按键,Release 也必须消费,保证 Press/Release 成对
+  if (key < 256 && key_state == 0 && s->key_consumed_pressed[key]) {
+    s->key_consumed_pressed[key] = false;
+    if (key == KEY_BACKSPACE) {
+      s->backspace_active = false;
+      struct itimerspec its = {0};
+      timerfd_settime(s->repeat_timer_fd, 0, &its, NULL);
+    }
+    return;
+  }
+
   // Shift 组合跟踪：shift 按下期间有其他非 shift 键按下，标记为组合
   if (s->shift_count > 0 && key_state == 1 && key != KEY_LEFTSHIFT &&
       key != KEY_RIGHTSHIFT)
     s->shift_combo = true;
 
-  // 非退格键按下时，取消退格 repeat 并 disarm timerfd
+  // 非退格键按下时，取消退格 repeat 并 disarm timerfd。
+  // [zh] 指示若仍挂起且尚未组字,立即撤下并清空 preedit 再放行按键:
+  // 无按键时由主循环 400ms 超时负责消失;一旦开始按键则立即消失,
+  // 避免 GTK 等客户端把随后透传的字符并入指示的 preedit 区域,随清屏被一并删除。
   if (key != KEY_BACKSPACE && key_state == 1) {
     s->backspace_active = false;
-    s->zh_indicator_active = false;
+    if (s->zh_indicator_active && s->buf_len == 0) {
+      s->zh_indicator_active = false;
+      clear_preedit(s);
+    }
     struct itimerspec its = {0};
     timerfd_settime(s->repeat_timer_fd, 0, &its, NULL);
   }
@@ -570,7 +605,8 @@ static void handle_grab_key(void *data,
   }
 
   // 3. 全角标点
-  if (s->punct_fullwidth && !ctrl && !alt) {
+  // 仅无修饰键或仅 Shift 时转全角标点;Ctrl/Alt/Super 组合必须透传
+  if (s->punct_fullwidth && (s->active_mods & ~0x01) == 0) {
     const char *punct_str = NULL;
     if (key == KEY_COMMA)
       punct_str = shift ? "《" : "，";
@@ -612,12 +648,30 @@ static void handle_grab_key(void *data,
     if (punct_str) {
       consume = true;
       if (pressed) {
-        if (composing && s->total > 0)
-          commit_candidate_at(s, s->page * PAGE_SIZE);
+        if (composing) {
+          if (s->total > 0)
+            commit_candidate_at(s, s->page * PAGE_SIZE);
+          else
+            zwp_input_method_v2_commit_string(s->input_method, s->buffer);
+        }
         zwp_input_method_v2_commit_string(s->input_method, punct_str);
         clear_preedit(s);
+        reset_state(s);
       }
     }
+  }
+
+  // Shift+字母:先结清挂起的 preedit,再透传。
+  // 单独 Shift 按下/释放用于切换中英文,按下时不能清 preedit,因此这里补结清;
+  // Ctrl/Alt/Super 组合在对应修饰键按下时已由 clear_composing 处理,无需重复。
+  if (!consume && pressed && composing && shift && c >= 'a' && c <= 'z' &&
+      (s->active_mods & ~0x01) == 0) {
+    if (s->total > 0)
+      commit_candidate_at(s, s->page * PAGE_SIZE);
+    else
+      zwp_input_method_v2_commit_string(s->input_method, s->buffer);
+    clear_preedit(s);
+    reset_state(s);
   }
 
   // 修饰键组合全部透传
@@ -648,13 +702,13 @@ static void handle_grab_key(void *data,
       }
     }
   }
-  // C. 数字键 1-3
+  // C. 数字键 1-3:仅当对应候选存在时消费,否则走兜底
   else if (key >= KEY_1 && key <= KEY_3 && composing) {
-    consume = true;
-    if (pressed) {
-      int idx = key - KEY_1;
-      int real = s->page * PAGE_SIZE + idx;
-      if (real < s->total)
+    int idx = key - KEY_1;
+    int real = s->page * PAGE_SIZE + idx;
+    if (real < s->total) {
+      consume = true;
+      if (pressed)
         commit_candidate_at(s, real);
     }
   }
@@ -743,8 +797,25 @@ static void handle_grab_key(void *data,
     }
   }
 
-  if (!consume)
+  // 记录被消费的按下事件,Release 时成对消费,避免把孤立的 Release 透传给应用。
+  if (consume && pressed && key < 256)
+    s->key_consumed_pressed[key] = true;
+
+  // 兜底透传:任何未消费键先结清挂起的 preedit 再放行。
+  // 若在组字中按下,先提交当前候选(无候选则提交编码),保证 GTK/Qt 等
+  // 客户端不会在 preedit 挂起时收到按键而把字符并入 preedit 区域被吞。
+  if (!consume) {
+    if (pressed && composing) {
+      if (s->total > 0)
+        commit_candidate_at(s, s->page * PAGE_SIZE);
+      else {
+        zwp_input_method_v2_commit_string(s->input_method, s->buffer);
+        clear_preedit(s);
+        reset_state(s);
+      }
+    }
     passthrough_key(s, time, key, key_state);
+  }
 }
 
 static void handle_grab_modifiers(

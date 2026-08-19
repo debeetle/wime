@@ -1,28 +1,6 @@
 # wime — minimal IME based on the wayland text-input-method protocol directly
 
 基于 `zwp_input_method_v2` 的原生 Wayland 中文输入法,无外部输入法框架依赖,开机即用。
-wime 是一个多输入法项目:每个输入法一个目录,共用根目录的 Wayland 协议与 `xiaohe/` 下的公共词库/构建脚本。
-
-```
-wime/
-├── input-method-unstable-v2.xml    # Wayland 协议源码(所有输入法共用)
-├── virtual-keyboard-unstable-v1.xml
-├── xiaohe/                         # 小鹤双拼族公共文件
-│   ├── dict.h                      # 词典 mmap/查询
-│   ├── gen_dict.py                 # 词典构建脚本(源码目录作参数,word_freq.txt 读公共)
-│   ├── word_freq.txt               # 静态词频主表(按词索引,各输入法共用)
-│   ├── xhup/                       # xhup 输入法
-│   │   ├── dict.txt                # 可读词库源码(编码<TAB>词,各输入法私有)
-│   │   ├── user_dict.txt           # 用户自定义高优词(编码<TAB>词,各输入法私有)
-│   │   ├── Makefile
-│   │   └── main.c
-│   └── xhfly/                      # xhfly 输入法
-│       ├── dict.txt
-│       ├── user_dict.txt
-│       ├── Makefile
-│       └── main.c
-└── hu/  ...                        # (未来其它输入法)
-```
 
 ### 词典格式
 
@@ -36,8 +14,7 @@ wime/
 ## 构建
 
 ```sh
-make -C xiaohe/xhup   # 构建 xhup
-make -C xiaohe/xhfly  # 构建 xhfly
+make
 # 需安装 wayland-scanner、pkg-config、mold(option)
 ```
 
@@ -62,10 +39,6 @@ make -C xiaohe/xhfly  # 构建 xhfly
 - `word_freq.txt` 提供的静态词频始终参与排序,是用户词频的底座。
 
 ## 使用
-
-```sh
-./xiaohe/xhfly/xhfly   # 需在 Wayland 会话中运行
-```
 
 - 输入小鹤双拼编码自动组字;
 - `=`: 预览下一个候选 / 候选框翻页下一页;`-`: 上一候选 / 上一页;
